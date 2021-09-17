@@ -1,0 +1,340 @@
+# ---------------------------------------------------------------------------- #
+# ------------ Code for testing deltaCI, Steve Wang, Feb 17 2019 ------------- #
+# ---------------------------------------------------------------------------- #
+
+# v1 2/17/19 replaces old testing code and strips out all pulses code
+# v2 2/18/19 splits up simulating and analyzing data, puts analysis into a function
+# v3 3/01/19 calls 3 new methods by Madison & Melissa; changed original version from v4 to v0
+# v4 3/04/19 runs in parallel using foreach and mclapply
+# v5 6/04/19 removed extraneous code, added simulation for non-uniform recovery
+# v5.1 6/25/19 EZ and KC added min/max number of finds and other minor changes
+# v6 7/30/19 runs only one method, changed output format
+
+
+
+# Clear workspace and load packages
+rm(list=ls()) 
+# library(DescTools)
+library(doParallel)
+library(compiler)
+enableJIT(3);  enableJIT(3)
+#source("~/Documents/Research/Adaptive range extensions/ abm38.2.R")
+source("~/Desktop/abm38.2.R")
+
+
+
+
+# ---------------------------------------------------------------------------- #
+# -------------------------- Function definitions ---------------------------- #
+# ---------------------------------------------------------------------------- #
+
+
+# Draw range chart
+plotrangechart <- function(data, ci, thetahi, thetalo)  {
+  ord <- order(data[1,])
+  data <- data[,ord]           # sort data by highest find
+  ci <- ci[ord]
+  ntaxa <- dim(data)[2]
+  maxfinds <- dim(data)[1]
+  ymax <- max(data[1,])
+  plot( NULL, pch="", xlab="", ylab="", xlim=c(0,ntaxa+1), 
+        ylim=c(-.3,ymax*2.1), bty="L", xaxt="n" )
+  for(taxon in 1:ntaxa)  {
+    # draw taxon lines
+    lines( c(taxon,taxon), c(0,data[1,taxon]), lwd=.9, col="darkgray" )
+    # plot fossil horizons
+    points(rep(taxon,maxfinds), data[,taxon], pch=16, cex=.65)
+    # plot confidence interval tops
+    points(taxon, ci[taxon], pch="^", cex=.65, col="red")
+    
+    points(taxon, c(thetahi,thetalo), cex=.65, col = "green")
+    
+  }
+}
+
+
+simnumtaxa <- function(mu=10, mintaxa=4, maxtaxa=20)
+# Simulate number of taxa found
+# mu: Poisson parameter; controls mean number of taxa
+# mintaxa: min number of taxa
+# maxtaxa: max number of taxa
+{
+  # Generate vector of numbers of taxa;
+  #   check to make sure this is not < mintaxa or > maxtaxa;
+  #   if so, set to mintaxa or maxtaxa, respectively
+  ntaxa <- rpois(1, mu)
+  if(ntaxa < mintaxa)  ntaxa <- mintaxa
+  if(ntaxa > maxtaxa)  ntaxa <- maxtaxa
+  return(ntaxa)
+}
+
+
+simthetas <- function(ntaxa, mintheta, maxtheta)
+# Simulate true extinctions (theta values)
+{
+  horiz <- runif(ntaxa, mintheta, maxtheta)   # note two of these are overwritten anyway,
+  horiz[1] <- mintheta                        #   but this way avoids having to separately 
+  horiz[ntaxa] <- maxtheta                    #   initialize the horiz vector
+  return(round(horiz,1))
+}
+
+
+simlambdas_old <- function(ntaxa, minlambda, maxlambda)
+# Simulate recovery parameters (lambda values)
+{
+  lambdas <- rnorm(ntaxa, mean=(minlambda+maxlambda)/2, sd=(maxlambda-minlambda)/6)
+  lambdas[lambdas > maxlambda] <- maxlambda    # set values exceeding limits to the limits
+  lambdas[lambdas < minlambda] <- minlambda
+  return(round(lambdas,2))
+}
+
+
+simlambdas <- function(ntaxa, meanlambda, sd, minlambda, maxlambda)  {
+# Simulate recovery parameters (lambda values)
+# lambdas are simulated around the specified meanlambda, which creates correlation among taxa
+  lambdas <- rnorm(ntaxa, mean=meanlambda, sd=sd)
+  lambdas[lambdas > maxlambda] <- maxlambda    # set values exceeding limits to the limits
+  lambdas[lambdas < minlambda] <- minlambda
+  return(round(lambdas,2))
+}
+
+
+simnumfinds <- function(ntaxa, mu=7, minfinds=3, maxfinds=30)
+# Simulate number of fossil finds found per taxon
+# ntaxa: number of taxa
+# mu: Poisson parameter; controls mean number of finds per taxa
+# maxfinds: max number of finds allowed per taxa
+{
+  # Generate number of finds for each taxa;
+  #   check to make sure none have <minfinds or >maxfinds horizons;
+  #   if so, adjust them to minfinds or maxfinds, respectively
+  numfinds <- rpois(ntaxa, mu)
+  numfinds[numfinds<minfinds] <- minfinds
+  numfinds[numfinds>maxfinds] <- maxfinds
+  return(numfinds)
+}
+
+
+simdata <- function(numtaxa=10, numocc, thetavec, lambdavec)
+# Returns a matrix of fossil occurrences 
+# numtaxa: number of taxa
+# numocc: vector of number of occurrences per taxon
+# thetavec: vector of true extinction horizons/times
+# lambdavec: vector of lambdas (recovery potential parameter)
+{
+  rrefbeta <- function(n,lambda)  {
+    if(lambda<=0)  { 
+      return(rbeta(n, 1, 1-lambda))
+    }  else  return(rbeta(n, 1+lambda, 1))
+  }
+  
+  # Simulate the occurrences for each taxa
+  maxocc <- max(numocc)
+  data <- matrix(NA, maxocc, numtaxa)
+  for(i in 1:numtaxa)
+    data[,i] <- c( sort( rrefbeta(numocc[i],lambdavec[i])*thetavec[i], decr=T),
+                   rep(NA, maxocc-numocc[i]) )
+  return(round(data,1))
+}
+
+
+analyzeResults <- function(ntaxa, truedelta, CIlo, CIhi, meanlambda, conf, filename)  {
+  # compute inverse logit
+  invlogit <- function(x)  {
+    return( 1 / (1 + exp(-x)) ) 
+  }
+
+  nreps <- length(ntaxa)
+  correct <- (CIlo <= truedelta) & (truedelta <= CIhi)
+  places <- 1            # decimal places to round output to
+  write.table(cbind(1:nreps, ntaxa, round(truedelta,places), round(CIlo,places), 
+                    round(CIhi,places), correct), paste(filename,"results.txt",sep=""), 
+                    sep="\t", row.names=F, col.names=c("rep","ntaxa","delta","CIlo","CIhi","corr"))
+  lengths <- CIhi - CIlo
+  sum(correct) / nreps
+  table(correct)                                             # correct
+  table(CIlo <= truedelta)                                   # lower endpoint
+  table(truedelta <= CIhi)                                   # upper endpoint
+  
+  # Set up plot
+  pdf(paste(filename, "results.pdf", sep=""), width=10, height=8)
+  par(mfrow=c(3,3), mai=c(1,1,1,1)*.6)
+
+  # Histogram of lower endpoints
+  hist(CIlo, col="darkgray",border="white", nclass=25, main="")
+  abline(v=median(CIlo), col="red")
+  title(main="lower endpoints")
+
+  # Histogram of upper endpoints
+  hist(CIhi, col="darkgray",border="white", nclass=25, main="")
+  abline(v=median(CIhi), col="red")
+  title(main="upper endpoints")
+
+  # Histogram of lengths
+  hist(lengths, col="darkgray",border="white", nclass=20, main="")
+  abline(v=median(lengths), col="red")
+  title(main="interval lengths")
+
+  # Barchart of lower endpoint coverage 
+  barplot(table(CIlo <= truedelta)/nreps, ylim=c(0,1))
+  title(main=paste("CI lower", round(sum(CIlo>truedelta)/nreps,3), "error"))
+  abline(h=(1-(1-conf)/2), col="red")
+  abline(h=((1-conf)/2), col="red")
+
+  # Barchart of upper endpoint coverage 
+  barplot(table(CIhi >= truedelta)/nreps, ylim=c(0,1))
+  title(main=paste("CI upper", round(sum(CIhi<truedelta)/nreps,3), "error"))
+  abline(h=(1-(1-conf)/2), col="red")
+  abline(h=((1-conf)/2), col="red")
+  
+  # Plot of coverage vs number of taxa
+  plot(jitter(ntaxa), correct, xlab="number of taxa", ylab="proportion correct")
+  logistic <- glm(correct ~ ntaxa, family=binomial)
+  xx <- seq(0, maxtaxa, 1)
+  lines(xx, invlogit(coef(logistic)[1] + xx*coef(logistic)[2]), col="blue")
+  abline(h=conf, col="red")
+  mtext(paste(round(sum(correct)/nreps,3) ,"correct        median",round(median(lengths),1),
+              "       mean",round(mean(lengths),1)), line=-1.97, outer=T)
+  
+  # Plot of coverage vs true delta
+  plot(truedelta, correct, xlab="delta", ylab="proportion correct")
+  logistic <- glm(correct ~ truedelta, family=binomial)
+  xx <- seq(0, MAXTHETA, 1)
+  lines(xx, invlogit(coef(logistic)[1] + xx*coef(logistic)[2]), col="blue")
+  abline(h=conf, col="red")
+  
+  # Plot of coverage vs length
+  plot(lengths, correct, xlab="CI length", ylab="proportion correct")
+  logistic <- glm(correct ~ lengths, family=binomial)
+  xx <- seq(0, MAXTHETA*1.2, 1)
+  lines(xx, invlogit(coef(logistic)[1] + xx*coef(logistic)[2]), col="blue")
+  abline(h=conf, col="red")
+
+  # Plot of coverage vs mean lambda
+  plot(meanlambda, correct, xlab="mean lambda", ylab="proportion correct")
+  logistic <- glm(correct ~ meanlambda, family=binomial)
+  xx <- seq(minlambda, maxlambda, .1)
+  lines(xx, invlogit(coef(logistic)[1] + xx*coef(logistic)[2]), col="blue")
+  abline(h=conf, col="red")
+   
+  dev.off()
+  return(correct)
+}
+
+
+
+
+
+# ---------------------------------------------------------------------------- #
+# ------------------------------ Run simulation ------------------------------ #
+# ---------------------------------------------------------------------------- #
+
+
+# Set parameters 
+nreps <- 5
+conf <- .9
+MAXTHETA <- 100
+mintaxa <- 4
+maxtaxa <- 30
+minlambda <- -2
+maxlambda <- -1
+PLOT <- 0
+minfinds <- 10
+maxfinds <- 10
+#codeversion <- "~/Documents/Research/Duration CIs 3 non-uniform/3 deltaCI abm summer 2020 (Danielle, Peem)/duration38.2.R"
+#codeversion <- "~/Documents/Research/Duration CIs 3 non-uniform/5 deltaCI abm spring 2021 (Emma, Jiung)/duration40.3.R"
+
+
+# Initialize
+ntaxa <- truedelta <- ntaxa <- obsd <- meanlambda <- rep(NA, nreps)
+thetas <- rep(NA, maxtaxa)
+datasets <- list()
+filename <- paste("~/Desktop/results abm ", nreps, "reps ", sep="")
+
+# Save parameters 
+values <- rbind(nreps, conf, MAXTHETA, mintaxa, maxtaxa, minlambda, maxlambda, minfinds, maxfinds)
+write.table(values, file=paste(filename,"results params.txt",sep=""), col.names=F)
+
+
+
+
+# ------------------------------- Create datasets ---------------------------- #
+
+for(i in 1:nreps)  {
+  
+  # Choose number of taxa  
+  ntaxa[i] <- simnumtaxa(mintaxa=mintaxa, maxtaxa=maxtaxa)
+  
+  # Set limits for true theta values  
+  if(runif(1) < .1)  {
+    mintheta <- MAXTHETA     # 10% of the time, set delta = 0
+  }  else  {
+    mintheta <- runif(1, MAXTHETA/10, MAXTHETA)   # otherwise, choose min theta randomly
+  }
+  # Choose true theta values  
+  thetas <- simthetas(ntaxa[i], mintheta, MAXTHETA)
+  truedelta[i] <- max(thetas) - min(thetas) 
+#  truedelta[i] <- (thetas[2]) - (thetas[1]) 
+  
+  # Choose true lambda values  
+  meanlambda[i] <- rnorm(1, mean=(minlambda+maxlambda)/2, sd=(maxlambda-minlambda)/4)
+  lambdas <- simlambdas(ntaxa[i], meanlambda[i], sd=(maxlambda-minlambda)/4, minlambda, maxlambda)  
+  
+  # Create dataset
+  x <- simdata(ntaxa[i], simnumfinds(ntaxa[i], minfinds=minfinds, maxfinds=maxfinds), thetavec=thetas, lambdavec=lambdas)
+  # Save dataset in list
+  datasets[[i]] <- x
+  
+  # Plot a range chart of the dataset
+  if(PLOT) {
+    ci <- rep(NA, ntaxa[i])
+    for(j in 1:ntaxa[i]) 
+      ci[j] <- abm38(na.omit(x[,j]), conf=conf)[3]
+    plotrangechart(x, ci)
+  }
+  
+}
+
+
+
+# ------------------------------- Run deltaCI -------------------------------- #
+
+
+source(codeversion)
+start <- Sys.time()
+cl <- makeCluster(detectCores(), outfile = "")
+registerDoParallel(cl)
+# Calculate CI
+result <- foreach(i = 1:nreps, .combine = c) %dopar% {
+  cat(i, " ")
+  deltaCI41(datasets[[i]], conf=conf, PLOT=0)
+}
+stopCluster(cl)
+end <- Sys.time();    end-start    # show running time
+result <- matrix(result, nreps, 3, byrow=T)
+CIlo <- result[,1];       CIhi <- result[,2]
+length <- CIhi - CIlo
+obsd <- result[,3]
+
+
+
+# Analyze results
+corr <- analyzeResults(ntaxa, truedelta, CIlo, CIhi, meanlambda, conf, filename)
+table(corr)
+table(CIlo <= truedelta)
+table(CIhi >= truedelta)
+
+
+
+# Save workspace
+save.image(paste(filename, "results.Rdata", sep=""))
+
+# Clean up
+# make a new folder in the working directory
+timestamp <- format(Sys.time(), "%b %d %Y %X")
+foldername <- paste("'", "results", " ", timestamp, "'", sep="")
+system(paste("mkdir", foldername))
+# move files into folder
+system(paste("mv 'results abm ", "'* ",  foldername, sep=""))
+
+

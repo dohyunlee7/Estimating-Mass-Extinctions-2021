@@ -1,0 +1,9 @@
+"nreps" 1000
+"conf" 0.9
+"MAXTHETA" 100
+"mintaxa" 4
+"maxtaxa" 30
+"minlambda" -1
+"maxlambda" -0.1
+"minfinds" 10
+"maxfinds" 10
